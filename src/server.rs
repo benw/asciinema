@@ -3,11 +3,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 
+use anyhow::anyhow;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::ws::{self, CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::serve::ListenerExt;
 use axum::Router;
@@ -21,7 +22,7 @@ use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing::info;
 
 use crate::alis;
-use crate::stream::Subscriber;
+use crate::stream::{Event, Subscriber};
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
@@ -50,6 +51,7 @@ pub async fn serve(
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/snapshot.txt", get(snapshot_handler))
         .with_state(state)
         .fallback(static_handler)
         .layer(trace);
@@ -170,5 +172,33 @@ fn ws_result(m: Result<Vec<u8>, BroadcastStreamRecvError>) -> Result<Message, ax
     match m {
         Ok(bytes) => Ok(Message::Binary(bytes.into())),
         Err(e) => Err(axum::Error::new(e)),
+    }
+}
+
+async fn snapshot_handler(State(state): State<AppState>) -> Result<String, Error> {
+    let mut stream = state.subscriber.subscribe().await?;
+    let Some(event) = stream.next().await else {
+        return Err(anyhow!("stream closed without Init event").into());
+    };
+    match event? {
+        Event::Init(_id, _duration, _size, _theme, data) => Ok(data),
+        _ => Err(anyhow!("expected Init as first event").into())
+    }
+}
+
+struct Error(anyhow::Error);
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
+    }
+}
+
+impl<E> From<E> for Error
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
     }
 }
